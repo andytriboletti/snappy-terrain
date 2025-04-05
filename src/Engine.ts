@@ -24,6 +24,8 @@ import { getRapier } from './physics/rapier';
 import { TerrainShape } from './terrain/TerrainShape';
 import { Dwarf } from './dwarf/Dwarf';
 import * as RAPIER from '@dimforge/rapier3d';
+import { TreeGenerator } from './generation/TreeGenerator';
+import { RockGenerator } from './generation/RockGenerator';
 
 const cameraOffset = new Vector3();
 
@@ -68,9 +70,11 @@ export class Engine {
     this.sphere.castShadow = true;
     this.scene.add(this.sphere);
 
-    // Create terrain visuals
-    for (let y = -32; y < 32; y += 16) {
-      for (let x = -32; x < 32; x += 16) {
+    // Create terrain visuals (Expanded Area)
+    const terrainRange = 64; // Half-width/depth of the terrain area
+    const terrainStep = 16; // Size of each terrain patch
+    for (let y = -terrainRange; y < terrainRange; y += terrainStep) {
+      for (let x = -terrainRange; x < terrainRange; x += terrainStep) {
         const terrain = new TerrainShape(new Vector3(x, 0, y));
         terrain.addToScene(this.scene);
         this.terrain.push(terrain);
@@ -78,8 +82,9 @@ export class Engine {
       }
     }
 
-    // Create ground visual
-    const groundGeometry = new PlaneGeometry(100, 100);
+    // Create ground visual (Expanded Size)
+    const groundSize = terrainRange * 2 + terrainStep; // Make ground slightly larger than terrain area
+    const groundGeometry = new PlaneGeometry(groundSize, groundSize);
     const groundMaterial = new MeshStandardMaterial({ color: 0x808080 });
     this.ground = new Mesh(groundGeometry, groundMaterial);
     this.ground.rotation.x = -Math.PI / 2;
@@ -147,13 +152,39 @@ export class Engine {
     this.characterController.enableAutostep(0.3, 0.2, true); 
     this.characterController.enableSnapToGround(0.5); 
 
-    // Create Dwarf and Add Physics LAST (after world and controller exist)
+    // --- Generate Features --- 
+    const generationAreaSize = 128; // Match expanded terrain range
+    const treeGen = new TreeGenerator({
+        count: 200, // Number of trees
+        areaSize: generationAreaSize,
+        world: this.physicsWorld,
+        rapier: r,
+        scene: this.scene,
+        pool: this.pool // Pass the resource pool
+    });
+    treeGen.generate();
+
+    const rockGen = new RockGenerator({
+        count: 100, // Number of rocks
+        areaSize: generationAreaSize,
+        minSize: 0.5,
+        maxSize: 2.5,
+        world: this.physicsWorld,
+        rapier: r,
+        scene: this.scene,
+        pool: this.pool // Pass the resource pool
+    });
+    rockGen.generate();
+    // --- End Generate Features --- 
+
+    // Create Dwarf and Add Physics LAST
     this.dwarf = new Dwarf();
     this.dwarf.addPhysics(this.physicsWorld, r);
     this.scene.add(this.dwarf);
 
     console.log('Engine attached and physics initialized.');
 
+    // Start the animation loop
     if (!this.frameId) {
       this.clock.start();
       this.frameId = requestAnimationFrame(this.animate);
