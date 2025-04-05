@@ -19,9 +19,10 @@ export class TerrainShape {
   private positionBuffer = new Float32BufferAttribute(TERRAIN_STRIDE ** 2 * 18, 3);
   private geometry = new BufferGeometry();
   private material = new MeshStandardMaterial({ color: new Color(0x448833) });
-  private mesh = new Mesh(this.geometry, this.material);
+  private mesh: Mesh;
 
   constructor(private origin: Vector3) {
+    this.mesh = new Mesh(this.geometry, this.material);
     this.mesh.position.copy(origin);
     this.mesh.matrixAutoUpdate = false;
     this.mesh.updateMatrix();
@@ -113,6 +114,10 @@ export class TerrainShape {
       new Vector3(TERRAIN_SIZE, 1, TERRAIN_SIZE)
     );
     world.createCollider(clDesc, terrainBody);
+  }
+
+  public getMesh(): Mesh {
+    return this.mesh;
   }
 }
 

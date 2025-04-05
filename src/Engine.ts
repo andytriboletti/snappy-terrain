@@ -13,6 +13,9 @@ import {
   sRGBEncoding,
   Vector3,
   WebGLRenderer,
+  Raycaster,
+  Vector2,
+  PlaneGeometry,
 } from 'three';
 import { EventSource, ResourcePool } from './lib';
 import { getRapier, Rapier } from './physics/rapier';
@@ -31,6 +34,10 @@ export class Engine {
   public viewAngle = 0;
   public readonly update = new EventSource<{ update: number }>();
   public rapier!: Rapier;
+  private ground: Mesh;
+  private raycaster = new Raycaster();
+  private mouse = new Vector2();
+  private selectedDwarf: Dwarf | null = null;
 
   private mount: HTMLElement | undefined;
   private frameId: number | null = null;
@@ -44,7 +51,7 @@ export class Engine {
 
   constructor() {
     this.animate = this.animate.bind(this);
-    this.camera = new PerspectiveCamera(40, 1, 0.1, 100);
+    this.camera = new PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
     this.sunlight = this.createSunlight();
     this.createAmbientLight();
     this.renderer = this.createRenderer();
@@ -69,16 +76,29 @@ export class Engine {
       }
     }
 
+    // Create ground
+    const groundGeometry = new PlaneGeometry(100, 100);
+    const groundMaterial = new MeshStandardMaterial({ color: 0x808080 });
+    this.ground = new Mesh(groundGeometry, groundMaterial);
+    this.ground.rotation.x = -Math.PI / 2;
+    this.scene.add(this.ground);
+
     cameraOffset.setFromSphericalCoords(20, MathUtils.degToRad(75), this.viewAngle);
     this.camera.position.copy(this.viewPosition).add(cameraOffset);
     this.camera.lookAt(this.viewPosition);
     this.camera.updateMatrixWorld();
+
+    // Add event listeners
+    window.addEventListener('click', this.onMouseClick.bind(this));
+    window.addEventListener('keydown', this.onKeyDown.bind(this));
   }
 
   /** Shut down the renderer and release all resources. */
   public dispose() {
     this.pool.dispose();
     this.dwarf.dispose();
+    window.removeEventListener('click', this.onMouseClick.bind(this));
+    window.removeEventListener('keydown', this.onKeyDown.bind(this));
   }
 
   /** Attach the renderer to the DOM. */
@@ -219,5 +239,41 @@ export class Engine {
     lightPos.x = Math.round(lightPos.x);
     lightPos.z = Math.round(lightPos.z);
     this.sunlight.position.set(lightPos.x + 6, lightPos.y + 8, lightPos.z + 4);
+  }
+
+  private onMouseClick(event: MouseEvent) {
+    if (!this.dwarf) return;
+
+    const mouse = new Vector2(
+      (event.clientX / window.innerWidth) * 2 - 1,
+      -(event.clientY / window.innerHeight) * 2 + 1
+    );
+
+    const raycaster = new Raycaster();
+    raycaster.setFromCamera(mouse, this.camera);
+
+    if (this.selectedDwarf) {
+      // If we have a selected dwarf, try to move it
+      const intersects = raycaster.intersectObject(this.ground);
+      if (intersects.length > 0) {
+        const point = intersects[0].point;
+        this.selectedDwarf.setTargetPosition(point);
+      }
+    } else {
+      // Try to select the dwarf
+      const intersects = raycaster.intersectObject(this.dwarf, true);
+      if (intersects.length > 0) {
+        console.log('Dwarf selected!');
+        this.selectedDwarf = this.dwarf;
+        this.dwarf.setSelected(true);
+      }
+    }
+  }
+
+  private onKeyDown(event: KeyboardEvent) {
+    if (event.key === 'Escape' && this.selectedDwarf) {
+      this.selectedDwarf.setSelected(false);
+      this.selectedDwarf = null;
+    }
   }
 }
