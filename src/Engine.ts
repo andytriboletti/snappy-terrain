@@ -16,11 +16,14 @@ import {
   Raycaster,
   Vector2,
   PlaneGeometry,
+  Group,
+  AmbientLight,
 } from 'three';
 import { EventSource, ResourcePool } from './lib';
-import { getRapier, Rapier } from './physics/rapier';
+import { getRapier } from './physics/rapier';
 import { TerrainShape } from './terrain/TerrainShape';
 import { Dwarf } from './dwarf/Dwarf';
+import * as RAPIER from '@dimforge/rapier3d';
 
 const cameraOffset = new Vector3();
 
@@ -33,7 +36,7 @@ export class Engine {
   public readonly viewPosition = new Vector3();
   public viewAngle = 0;
   public readonly update = new EventSource<{ update: number }>();
-  public rapier!: Rapier;
+  public rapier!: typeof RAPIER;
   private ground: Mesh;
   private raycaster = new Raycaster();
   private mouse = new Vector2();
@@ -44,10 +47,13 @@ export class Engine {
   private clock = new Clock();
   private sunlight: DirectionalLight;
   private terrain: TerrainShape[] = [];
-  private physicsWorld?: World;
+  private physicsWorld!: RAPIER.World;
   private sphere: Mesh;
   private sphereBody?: RigidBody;
-  private dwarf: Dwarf;
+  private dwarf?: Dwarf;
+  private debugMarkerGroup: Group;
+  private characterController!: RAPIER.KinematicCharacterController;
+  private readonly gravity = new Vector3(0, -9.81, 0);
 
   constructor() {
     this.animate = this.animate.bind(this);
@@ -62,11 +68,7 @@ export class Engine {
     this.sphere.castShadow = true;
     this.scene.add(this.sphere);
 
-    // Create dwarf
-    this.dwarf = new Dwarf();
-    this.dwarf.addToScene(this.scene);
-
-    // Generate some terrain patches.
+    // Create terrain visuals
     for (let y = -32; y < 32; y += 16) {
       for (let x = -32; x < 32; x += 16) {
         const terrain = new TerrainShape(new Vector3(x, 0, y));
@@ -76,7 +78,7 @@ export class Engine {
       }
     }
 
-    // Create ground
+    // Create ground visual
     const groundGeometry = new PlaneGeometry(100, 100);
     const groundMaterial = new MeshStandardMaterial({ color: 0x808080 });
     this.ground = new Mesh(groundGeometry, groundMaterial);
@@ -88,6 +90,9 @@ export class Engine {
     this.camera.lookAt(this.viewPosition);
     this.camera.updateMatrixWorld();
 
+    this.debugMarkerGroup = new Group();
+    this.scene.add(this.debugMarkerGroup);
+
     // Add event listeners
     window.addEventListener('click', this.onMouseClick.bind(this));
     window.addEventListener('keydown', this.onKeyDown.bind(this));
@@ -96,45 +101,58 @@ export class Engine {
   /** Shut down the renderer and release all resources. */
   public dispose() {
     this.pool.dispose();
-    this.dwarf.dispose();
+    this.dwarf?.dispose();
     window.removeEventListener('click', this.onMouseClick.bind(this));
     window.removeEventListener('keydown', this.onKeyDown.bind(this));
+    if (this.characterController && this.physicsWorld) {
+      this.physicsWorld.removeCharacterController(this.characterController);
+    }
+    this.renderer.dispose();
   }
 
-  /** Attach the renderer to the DOM. */
+  /** Attach the renderer to the DOM and initialize physics. */
   public async attach(mount: HTMLElement) {
     this.mount = mount;
     window.addEventListener('resize', this.onWindowResize.bind(this));
     mount.appendChild(this.renderer.domElement);
     this.onWindowResize();
 
-    // Make sure physics WASM bundle is initialized before starting rendering loop.
-    // Physics objects cannot be created until after physics engine is initialized.
+    // Load Rapier
     const r = (this.rapier = await getRapier());
 
-    // Create physics for terrain
-    const gravity = new Vector3(0.0, -9.81, 0.0);
-    this.physicsWorld = new r.World(gravity);
+    // Create World
+    this.physicsWorld = new r.World({ x: 0.0, y: this.gravity.y, z: 0.0 });
+
+    // Create Terrain Physics
     this.terrain.forEach(terr => terr.addPhysics(this.physicsWorld!, r));
 
-    // Create rigid body for the sphere
-    const rbDesc = r.RigidBodyDesc.dynamic()
+    // Create Sphere Physics
+    const rbDescSphere = r.RigidBodyDesc.dynamic()
       .setTranslation(6, 4, 0)
       .setLinearDamping(0.1)
       .setCcdEnabled(true);
-    this.sphereBody = this.physicsWorld.createRigidBody(rbDesc);
-
-    // Add physics to dwarf
-    this.dwarf.addPhysics(this.physicsWorld, r);
-
-    const clDesc = this.rapier.ColliderDesc.ball(1)
+    this.sphereBody = this.physicsWorld.createRigidBody(rbDescSphere);
+    const clDescSphere = r.ColliderDesc.ball(1)
       .setFriction(0.1)
       .setFrictionCombineRule(r.CoefficientCombineRule.Max)
-      // .setTranslation(0, 0, 0)
       .setRestitution(0.6)
       .setRestitutionCombineRule(r.CoefficientCombineRule.Max);
-    // .setCollisionGroups(CollisionMask.ActorMask | CollisionMask.TouchActor);
-    this.physicsWorld.createCollider(clDesc, this.sphereBody);
+    this.physicsWorld.createCollider(clDescSphere, this.sphereBody);
+
+    // Create Character Controller
+    const controllerOffset = 0.01;
+    this.characterController = this.physicsWorld.createCharacterController(controllerOffset);
+    this.characterController.setMaxSlopeClimbAngle(45 * Math.PI / 180); 
+    this.characterController.setMinSlopeSlideAngle(30 * Math.PI / 180); 
+    this.characterController.enableAutostep(0.3, 0.2, true); 
+    this.characterController.enableSnapToGround(0.5); 
+
+    // Create Dwarf and Add Physics LAST (after world and controller exist)
+    this.dwarf = new Dwarf();
+    this.dwarf.addPhysics(this.physicsWorld, r);
+    this.scene.add(this.dwarf);
+
+    console.log('Engine attached and physics initialized.');
 
     if (!this.frameId) {
       this.clock.start();
@@ -158,7 +176,7 @@ export class Engine {
       this.physicsWorld.step();
       const spherePos = this.sphereBody!.translation();
       this.sphere.position.set(spherePos.x, spherePos.y, spherePos.z);
-      this.dwarf.update();
+      this.dwarf?.update();
     }
     this.update.emit('update', deltaTime);
   }
@@ -168,17 +186,53 @@ export class Engine {
     return this.clock.elapsedTime;
   }
 
-  private animate() {
-    const deltaTime = Math.min(this.clock.getDelta(), 0.1);
-    this.updateScene(deltaTime);
-    this.render();
-    this.frameId = window.requestAnimationFrame(this.animate);
-  }
+  private animate(time: number) {
+    requestAnimationFrame(this.animate);
 
-  /** Render the scene. */
-  public render() {
+    const deltaTime = Math.min(this.clock.getDelta(), 0.1);
+
+    // --- Physics Simulation --- 
+    // Update Character Controller first
+    if (this.dwarf && this.physicsWorld && this.characterController) {
+      const dwarfBody = this.dwarf.getBody();
+      const dwarfCollider = this.dwarf.getCollider();
+      
+      if (dwarfBody && dwarfCollider) {
+        const currentPosition = dwarfBody.translation();
+        const desiredMovement = this.dwarf.calculateDesiredMovement(deltaTime, this.gravity);
+        
+        this.characterController.computeColliderMovement(dwarfCollider, desiredMovement);
+        
+        const correctedMovement = this.characterController.computedMovement();
+        const newPosition = {
+          x: currentPosition.x + correctedMovement.x,
+          y: currentPosition.y + correctedMovement.y,
+          z: currentPosition.z + correctedMovement.z
+        };
+        dwarfBody.setNextKinematicTranslation(newPosition);
+      }
+    }
+    // Update other dynamic bodies (like the sphere)
+    if (this.physicsWorld && this.sphereBody) {
+        const spherePos = this.sphereBody.translation();
+        this.sphere.position.set(spherePos.x, spherePos.y, spherePos.z);
+    }
+
+    // Step the physics world AFTER setting kinematic targets and processing inputs
+    if (this.physicsWorld) {
+        this.physicsWorld.step();
+    }
+
+    // --- Update Visuals AFTER physics step --- 
+    if (this.dwarf) {
+        this.dwarf.updateVisuals(); 
+    }
+    
+    // Update camera / lights
     this.adjustLightPosition();
+
     this.renderer.render(this.scene, this.camera);
+    this.update.emit('update', deltaTime);
   }
 
   /** Handle window resize event. */
@@ -242,7 +296,7 @@ export class Engine {
   }
 
   private onMouseClick(event: MouseEvent) {
-    if (!this.dwarf) return;
+    if (!this.dwarf || !this.physicsWorld) return;
 
     const mouse = new Vector2(
       (event.clientX / window.innerWidth) * 2 - 1,
@@ -257,7 +311,7 @@ export class Engine {
       const intersects = raycaster.intersectObject(this.ground);
       if (intersects.length > 0) {
         const point = intersects[0].point;
-        this.selectedDwarf.setTargetPosition(point);
+        this.selectedDwarf.setTargetPosition(point, this.debugMarkerGroup);
       }
     } else {
       // Try to select the dwarf
@@ -273,6 +327,7 @@ export class Engine {
   private onKeyDown(event: KeyboardEvent) {
     if (event.key === 'Escape' && this.selectedDwarf) {
       this.selectedDwarf.setSelected(false);
+      this.selectedDwarf.clearTargetPosition();
       this.selectedDwarf = null;
     }
   }

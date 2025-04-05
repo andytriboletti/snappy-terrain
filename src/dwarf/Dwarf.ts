@@ -8,12 +8,13 @@ export class Dwarf extends Group {
   private selectionRing!: Line;
   private targetPosition?: Vector3;
   private debugMarker?: Group;
-  private debugMarkerGroup: Group;
+  private readonly stopThreshold = 0.1; // Stop when close AND slow
+  private readonly forceFactor = 10.0; // How strongly force scales with distance
+  private readonly maxForce = 40.0;    // Max force to apply
+  private collider?: any; // Use specific Rapier Collider type if available
 
   constructor() {
     super();
-    this.debugMarkerGroup = new Group();
-    this.add(this.debugMarkerGroup);
     this.createDwarf();
     this.createSelectionRing();
   }
@@ -82,20 +83,25 @@ export class Dwarf extends Group {
   public addPhysics(world: World, rapier: any) {
     if (this.isDropped) return;
 
-    const colliderDesc = rapier.ColliderDesc.cuboid(0.6, 1.5, 0.4)
-      .setTranslation(0, 1.5, 0)
+    // Use a capsule collider for potentially smoother movement
+    // Use standard capsule(halfHeight, radius) instead of capsuleY
+    const halfHeight = 1.0 / 2;
+    const radius = 0.5;
+    const colliderDesc = rapier.ColliderDesc.capsule(halfHeight, radius)
+      .setTranslation(0, halfHeight + radius, 0) // Center the capsule properly (bottom sphere at y=0)
       .setFriction(0.7)
       .setRestitution(0.0);
 
-    const rbDesc = rapier.RigidBodyDesc.dynamic()
-      .setTranslation(0, 5, 0)
-      .setLinearDamping(1.0)
-      .setAngularDamping(1.0)
-      .setCanSleep(false)
-      .setCcdEnabled(true);
+    // *** Change to Kinematic Position Based ***
+    const rbDesc = rapier.RigidBodyDesc.kinematicPositionBased()
+      .setTranslation(0, 5, 0) // Start position
+      // Damping is not directly used by kinematic bodies in the same way
+      .setCcdEnabled(true); // Still good practice
 
     this.body = world.createRigidBody(rbDesc);
-    world.createCollider(colliderDesc, this.body);
+    const collider = world.createCollider(colliderDesc, this.body);
+    this.collider = collider; 
+
     this.isDropped = true;
   }
 
@@ -111,10 +117,10 @@ export class Dwarf extends Group {
     return this.isSelected;
   }
 
-  private createDebugMarker(position: Vector3) {
+  private createDebugMarker(position: Vector3, parentGroup: Group) {
     // Remove existing marker if any
     if (this.debugMarker) {
-      this.debugMarkerGroup.remove(this.debugMarker);
+      this.debugMarker.removeFromParent();
     }
 
     // Create X shape
@@ -139,55 +145,39 @@ export class Dwarf extends Group {
     markerGroup.add(line2);
     // Ensure marker is always at ground level
     markerGroup.position.set(position.x, 0.01, position.z); // Slightly above ground to prevent z-fighting
-    this.debugMarkerGroup.add(markerGroup);
+    parentGroup.add(markerGroup);
     this.debugMarker = markerGroup;
   }
 
-  public setTargetPosition(position: Vector3) {
-    // Store target position at ground level
-    this.targetPosition = new Vector3(position.x, 0, position.z);
-    this.createDebugMarker(this.targetPosition);
-    
+  public setTargetPosition(position: Vector3, debugGroup: Group) {
+    // ONLY set the target. No velocity/force changes here.
     if (!this.body || !this.isSelected) return;
 
-    const currentPos = this.body.translation();
-    const direction = new Vector3(
-      this.targetPosition.x - currentPos.x, // Use targetPosition here
-      0,
-      this.targetPosition.z - currentPos.z  // Use targetPosition here
-    );
-    const distance = direction.length();
-
-    // If starting very close to the target, just stop/don't apply force
-    if (distance < 0.15) {
-      this.stopMovement();
-      return;
+    // Clear previous target marker if needed
+    if (this.debugMarker) {
+        this.debugMarker.removeFromParent();
+        this.debugMarker = undefined;
     }
 
-    // Normalize direction and apply initial force
-    direction.normalize();
-    // Reduced initial force, relying more on update loop braking
-    const forceMagnitude = Math.min(distance * 5, 20); 
-    this.body.addForce(
-      { x: direction.x * forceMagnitude, y: 0, z: direction.z * forceMagnitude },
-      true
-    );
+    // Store new target position at ground level
+    this.targetPosition = new Vector3(position.x, 0, position.z);
+    this.createDebugMarker(this.targetPosition, debugGroup);
   }
 
   public update() {
     if (!this.body) return;
 
-    // Update visual position to match physics body
+    // Update visual position
     const position = this.body.translation();
     this.position.set(position.x, position.y, position.z);
 
-    // Update selection ring position to stay at ground level
+    // Update selection ring
     if (this.selectionRing) {
       this.selectionRing.position.y = -position.y;
       this.selectionRing.visible = this.isSelected;
     }
 
-    if (!this.targetPosition) return;
+    if (!this.targetPosition) return; // No target, do nothing
 
     const direction = new Vector3(
       this.targetPosition.x - position.x,
@@ -196,48 +186,40 @@ export class Dwarf extends Group {
     );
     const distance = direction.length();
     const velocity = this.body.linvel();
+    const speedXZ = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
 
-    // --- Stopping Conditions ---
-    // 1. Reached target
-    if (distance < 0.15) { // Slightly smaller threshold for precise stop
+    // --- Stop Condition --- (Relies on damping to slow down first)
+    if (distance < this.stopThreshold && speedXZ < 0.5) {
       this.stopMovement();
       return;
     }
+    // Optional: Add an overshoot stop condition if needed later
+    // const dotProduct = direction.x * velocity.x + direction.z * velocity.z;
+    // if (dotProduct < 0 && distance < this.stopThreshold * 2 && speedXZ < 1.0) { ... }
 
-    // 2. Overshot target (moving away)
-    const dotProduct = direction.x * velocity.x + direction.z * velocity.z;
-    if (dotProduct < 0 && distance < 0.5) { // Only stop if already close when overshooting
-      this.stopMovement();
-      return;
-    }
-
-    // --- Movement Logic ---
-    // Apply continuous braking force, stronger when closer to the target
-    const speed = Math.sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
-    if (speed > 0.1) { // Only apply brake if moving
-        // Stronger brake when close, gentler when further away
-        const brakeFactor = Math.max(1.0, 5.0 / (distance + 0.1)); // Inverse relationship with distance
-        const brakeForce = { x: -velocity.x * brakeFactor, y: 0, z: -velocity.z * brakeFactor };
-        this.body.addForce(brakeForce, true);
-    }
-
-    // Re-apply gentle force towards target if moving too slow and far away
-    if (speed < 1.0 && distance > 0.5) {
-        direction.normalize();
-        const gentleForceMagnitude = 5.0; // Small constant force
-        this.body.addForce(
-          { x: direction.x * gentleForceMagnitude, y: 0, z: direction.z * gentleForceMagnitude },
-          true
-        );
+    // --- Simple Movement Force ---
+    if (distance > 0.05) { // Only apply force if not extremely close
+      let forceMagnitude = distance * this.forceFactor;
+      forceMagnitude = Math.min(forceMagnitude, this.maxForce); // Cap the force
+      
+      direction.normalize();
+      const propulsionForce = {
+          x: direction.x * forceMagnitude,
+          y: 0,
+          z: direction.z * forceMagnitude
+      };
+      this.body.addForce(propulsionForce, true);
     }
   }
 
   private stopMovement() {
     if (!this.body) return;
-    this.body.setLinvel({ x: 0, y: 0, z: 0 }, true);
+    // Preserve Y velocity, kill XZ velocity
+    this.body.setLinvel({ x: 0, y: this.body.linvel().y, z: 0 }, true);
+    // Maybe reset forces if supported: this.body.resetForces(true);
     this.targetPosition = undefined;
     if (this.debugMarker) {
-      this.debugMarkerGroup.remove(this.debugMarker);
+      this.debugMarker.removeFromParent();
       this.debugMarker = undefined;
     }
   }
@@ -252,5 +234,67 @@ export class Dwarf extends Group {
 
   public getTargetPosition(): Vector3 | undefined {
     return this.targetPosition;
+  }
+
+  public getCollider(): any | undefined { // Return specific type if possible
+      return this.collider;
+  }
+
+  public clearTargetPosition() {
+    this.targetPosition = undefined;
+    if (this.debugMarker) {
+      this.debugMarker.removeFromParent();
+      this.debugMarker = undefined;
+    }
+    // Optionally, also reset velocity if desired when deselecting
+    // if (this.body) {
+    //   this.body.setLinvel({ x: 0, y: this.body.linvel().y, z: 0 }, true);
+    // }
+  }
+
+  public calculateDesiredMovement(deltaTime: number, gravity: Vector3): { x: number; y: number; z: number } {
+    let desiredMovement = new Vector3(0, 0, 0);
+
+    // Apply gravity (scaled by deltaTime)
+    desiredMovement.addScaledVector(gravity, deltaTime);
+
+    // Apply movement towards target if applicable
+    if (this.targetPosition && this.body) {
+        const position = this.body.translation(); // Use physics body position
+        const direction = new Vector3(
+            this.targetPosition.x - position.x,
+            0,
+            this.targetPosition.z - position.z
+        );
+        const distance = direction.length();
+
+        // Stop condition is handled by controller, just calculate desired velocity
+        if (distance > this.stopThreshold * 0.5) { // Only move if not extremely close
+            direction.normalize();
+            desiredMovement.x += direction.x * this.forceFactor * deltaTime; // Use forceFactor as a proxy for speed influence
+            desiredMovement.z += direction.z * this.forceFactor * deltaTime; 
+        }
+    }
+    // Clamp horizontal movement speed if needed?
+    // const speedXZ = Math.sqrt(desiredMovement.x * desiredMovement.x + desiredMovement.z * desiredMovement.z);
+    // const maxSpeed = someValue * deltaTime;
+    // if (speedXZ > maxSpeed) { ... scale x/z ... }
+
+    return { x: desiredMovement.x, y: desiredMovement.y, z: desiredMovement.z };
+  }
+
+  public updateVisuals() {
+      if (!this.body) return;
+      // Update visual position to match physics body AFTER physics step
+      const position = this.body.translation();
+      this.position.set(position.x, position.y, position.z);
+
+      // Update selection ring
+      if (this.selectionRing) {
+          // Adjust Y based on actual body position, not just negating it
+          this.selectionRing.position.y = -position.y + 0.01; // Slightly above ground
+          this.selectionRing.rotation.x = -Math.PI / 2; // Keep it flat on XZ plane
+          this.selectionRing.visible = this.isSelected;
+      }
   }
 } 
